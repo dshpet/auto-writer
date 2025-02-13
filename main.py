@@ -40,8 +40,20 @@ OUTLINE_THRESHOLD = 75.0
 EXPANSION_THRESHOLD = 80.0
 REFINEMENT_THRESHOLD = 95.0
 
-# For expansion, only feed the last CHUNK_SIZE characters from the current story.
-CHUNK_SIZE = 1000
+# ----------------------------
+# Dynamic Context Helpers
+# ----------------------------
+def get_context_char_limit(llm: ChatOpenAI, fraction: float = 1.0) -> int:
+    """
+    Returns an approximate character limit based on the LLM's max token setting.
+    Uses a rough conversion of 1 token ≈ 4 characters.
+    If the LLM does not expose max_tokens, defaults to 8192 tokens.
+    """
+    try:
+        max_tokens = llm.max_tokens  # If available
+    except AttributeError:
+        max_tokens = 8192
+    return int(max_tokens * 4 * fraction)
 
 # ----------------------------
 # Create LLM Instances
@@ -77,6 +89,21 @@ async def async_invoke(chain: Any, params: Dict[str, Any], retries: int = 3, del
 def build_chains(template: str, input_vars: List[str], llm_list: List[ChatOpenAI]) -> List[Any]:
     prompt = PromptTemplate(template=template, input_variables=input_vars)
     return [prompt | llm for llm in llm_list]
+
+# ----------------------------
+# Helper Function to Split Text into Chunks
+# ----------------------------
+def split_text_into_chunks(text: str, chunk_size: int, overlap: int) -> List[str]:
+    """
+    Split text into chunks of size `chunk_size` with an overlap.
+    """
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start = end - overlap
+    return chunks
 
 # ----------------------------
 # Define Prompt Templates
@@ -268,7 +295,9 @@ async def generate_candidates_outline(state: Dict[str, Any]) -> List[str]:
 async def generate_candidates_expansion(state: Dict[str, Any]) -> List[str]:
     outline = state.get("outline", "")
     full_story = state.get("story", "")
-    chunk = full_story[-CHUNK_SIZE:] if len(full_story) > CHUNK_SIZE else full_story
+    # Dynamically determine the chunk size for expansion using the first generation LLM.
+    expansion_chunk_size = get_context_char_limit(llms[0], 0.3)
+    chunk = full_story[-expansion_chunk_size:] if len(full_story) > expansion_chunk_size else full_story
     tasks = [async_invoke(chain, {"objective": state["objective"], "outline": outline, "chunk": chunk})
              for chain in expansion_chains]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -282,18 +311,44 @@ async def generate_candidates_expansion(state: Dict[str, Any]) -> List[str]:
     return candidates
 
 async def generate_candidates_refinement(state: Dict[str, Any]) -> List[str]:
-    try:
-        res = await async_invoke(refinement_chain, {
-            "objective": state["objective"],
-            "idea": state.get("idea", ""),
-            "outline": state.get("outline", ""),
-            "story": state.get("story", "")
-        })
-        candidate = res if isinstance(res, str) else res.content.strip()
+    story_text = state.get("story", "")
+    # Dynamically get the robust model's context window in characters.
+    robust_context_chars = get_context_char_limit(robust_llm, 1.0)
+    # For refinement, leave room for idea and outline; use 80% of context for story.
+    refine_chunk_size = get_context_char_limit(robust_llm, 0.8)
+    refine_chunk_overlap = get_context_char_limit(robust_llm, 0.1)
+    if len(story_text) > robust_context_chars:
+        logging.info("Story is too long for a single refinement call; splitting into chunks...")
+        chunks = split_text_into_chunks(story_text, refine_chunk_size, refine_chunk_overlap)
+        refined_chunks = []
+        for idx, chunk in enumerate(chunks):
+            try:
+                logging.info(f"Refining chunk {idx+1}/{len(chunks)} (first 200 chars): {chunk[:200]}...")
+                res = await async_invoke(refinement_chain, {
+                    "objective": state["objective"],
+                    "idea": state.get("idea", ""),
+                    "outline": state.get("outline", ""),
+                    "story": chunk
+                })
+                refined_chunk = res if isinstance(res, str) else res.content.strip()
+                refined_chunks.append(refined_chunk)
+            except Exception:
+                logging.exception(f"Error refining chunk {idx+1}")
+        candidate = "\n".join(refined_chunks)
         return [candidate]
-    except Exception:
-        logging.exception("Error generating refinement candidate")
-        return []
+    else:
+        try:
+            res = await async_invoke(refinement_chain, {
+                "objective": state["objective"],
+                "idea": state.get("idea", ""),
+                "outline": state.get("outline", ""),
+                "story": story_text
+            })
+            candidate = res if isinstance(res, str) else res.content.strip()
+            return [candidate]
+        except Exception:
+            logging.exception("Error generating refinement candidate")
+            return []
 
 # ----------------------------
 # Asynchronous Phase Handlers
