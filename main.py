@@ -45,14 +45,11 @@ REFINEMENT_THRESHOLD = 95.0
 # ----------------------------
 def get_context_char_limit(llm: ChatOpenAI, fraction: float = 1.0) -> int:
     """
-    Returns an approximate character limit based on the LLM's max token setting.
-    Uses a rough conversion of 1 token ≈ 4 characters.
-    If the LLM does not expose max_tokens, defaults to 8192 tokens.
+    Returns an approximate character limit based on the LLM's max token setting,
+    assuming roughly 4 characters per token.
+    Defaults to 8192 tokens if the LLM's max_tokens is unavailable.
     """
-    try:
-        max_tokens = llm.max_tokens  # If available
-    except AttributeError:
-        max_tokens = 8192
+    max_tokens = getattr(llm, "max_tokens", 8192) or 8192
     return int(max_tokens * 4 * fraction)
 
 # ----------------------------
@@ -397,9 +394,9 @@ PHASE_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Any]] = {
 async def main() -> None:
     state: Dict[str, Any] = load_state()
     state["phase"] = state.get("phase", "idea")
-    state["iteration"] = state.get("iteration", 0)
+    state["iteration"] = int(state.get("iteration", 0))
     state["idea"] = state.get("idea", "")
-    state["idea_iter"] = state.get("idea_iter", 0)
+    state["idea_iter"] = int(state.get("idea_iter", 0))
     state["objective"] = state.get("objective", (
         "Напиши коротке кібепанк оповідання, яке занурює читача у темний, технологічний світ майбутнього, де люди, корпорації та штучний інтелект "
         "борються за владу. Нехай система сама згенерує конспект, основні сюжетні лінії, розвиток персонажів та всі деталі, "
